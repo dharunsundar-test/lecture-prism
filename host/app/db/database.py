@@ -27,8 +27,9 @@ CREATE TABLE IF NOT EXISTS chunks (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- start_ms/end_ms are relative to the start of the segment's chunk.
--- The API converts them to session time using the durations of the preceding chunks.
+-- start_ms/end_ms are session-relative when chunk_id is NULL (session-level analysis).
+-- Rows from the earlier per-chunk pipeline have chunk_id set and chunk-relative times;
+-- the API converts those using the durations of the preceding chunks.
 CREATE TABLE IF NOT EXISTS classified_segments (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -60,7 +61,16 @@ MIGRATIONS = [
     ("sessions", "expected_chunks", "INTEGER"),
     ("chunks", "sha256", "TEXT"),
     ("classified_segments", "chunk_id", "TEXT"),
+    # NULL = analysis needed once all chunks are transcribed | 'running' | 'done' | 'failed'
+    ("sessions", "analysis_status", "TEXT"),
+    ("sessions", "error_msg", "TEXT"),
+    ("chunks", "transcript_path", "TEXT"),
+    ("classified_segments", "speaker_role", "TEXT"),
 ]
+
+# Chunk statuses: pending -> processing -> transcribed | failed.
+# 'done' is what the per-chunk pipeline used for a finished chunk; treat it as transcribed.
+TRANSCRIBED_STATUSES = ("transcribed", "done")
 
 
 def get_db() -> sqlite3.Connection:
@@ -127,8 +137,8 @@ def finalize_session(session_id: str, ended_at: int, expected_chunks: int):
 
 
 def refresh_session_status(session_id: str):
-    """Derive session status from its chunks. A session is only done once the phone has
-    finalized it and every expected chunk has arrived and been processed."""
+    """Derive session status from its chunks and analysis. A session is only done once the phone
+    has finalized it, every expected chunk is transcribed, and the session has been analysed."""
     with db_cursor() as conn:
         session = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
         if not session:
@@ -136,21 +146,64 @@ def refresh_session_status(session_id: str):
         statuses = [r["status"] for r in conn.execute("SELECT status FROM chunks WHERE session_id = ?", (session_id,))]
         expected = session["expected_chunks"]
 
-        if "failed" in statuses:
+        if "failed" in statuses or session["analysis_status"] == "failed":
             status = "failed"
         elif expected is None or len(statuses) < expected:
             status = "capturing"
-        elif all(s == "done" for s in statuses):
+        elif session["analysis_status"] == "done" and all(s in TRANSCRIBED_STATUSES for s in statuses):
             status = "done"
         else:
             status = "processing"
         conn.execute("UPDATE sessions SET status = ? WHERE id = ?", (status, session_id))
 
 
+def get_sessions_ready_for_analysis() -> list[str]:
+    with db_cursor() as conn:
+        rows = conn.execute(
+            f"""SELECT s.id FROM sessions s
+                WHERE s.expected_chunks IS NOT NULL
+                  AND s.analysis_status IS NULL
+                  AND (SELECT COUNT(*) FROM chunks c WHERE c.session_id = s.id) >= s.expected_chunks
+                  AND NOT EXISTS (
+                    SELECT 1 FROM chunks c WHERE c.session_id = s.id
+                      AND c.status NOT IN ({",".join("?" * len(TRANSCRIBED_STATUSES))})
+                  )
+                ORDER BY s.started_at""",
+            TRANSCRIBED_STATUSES,
+        ).fetchall()
+        return [row["id"] for row in rows]
+
+
+def set_session_analysis(session_id: str, analysis_status: str | None, error_msg: str | None = None):
+    with db_cursor() as conn:
+        conn.execute(
+            "UPDATE sessions SET analysis_status = ?, error_msg = ? WHERE id = ?",
+            (analysis_status, error_msg, session_id)
+        )
+
+
+def reprocess_session(session_id: str):
+    """Manual retry from the viewer: requeue failed chunks and redo the analysis. If the phone
+    never finalized the session, treat the chunks that did arrive as the whole recording."""
+    with db_cursor() as conn:
+        conn.execute(
+            "UPDATE chunks SET status = 'pending', error_msg = NULL WHERE session_id = ? AND status = 'failed'",
+            (session_id,)
+        )
+        conn.execute(
+            """UPDATE sessions SET analysis_status = NULL, error_msg = NULL,
+               expected_chunks = COALESCE(expected_chunks, (SELECT COUNT(*) FROM chunks WHERE session_id = ?))
+               WHERE id = ?""",
+            (session_id, session_id)
+        )
+
+
 def upsert_chunk(chunk_id: str, session_id: str, seq: int, audio_path: str, duration_ms: int,
                  size_bytes: int, sha256: str, started_at: int, ended_at: int):
-    """Insert a chunk, or replace a previous upload of it and queue it for processing again."""
+    """Insert a chunk, or replace a previous upload of it and queue it for processing again.
+    Either way the session's analysis is out of date."""
     with db_cursor() as conn:
+        conn.execute("UPDATE sessions SET analysis_status = NULL, error_msg = NULL WHERE id = ?", (session_id,))
         conn.execute(
             """INSERT INTO chunks (id, session_id, seq, audio_path, duration_ms, size_bytes, sha256,
                status, error_msg, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
@@ -185,10 +238,19 @@ def get_pending_chunks():
         return [dict(row) for row in rows]
 
 
-def reset_interrupted_chunks():
-    """Chunks left 'processing' by a crash or shutdown would otherwise never be picked up again."""
+def reset_interrupted_work():
+    """Work left mid-way by a crash or shutdown would otherwise never be picked up again."""
     with db_cursor() as conn:
         conn.execute("UPDATE chunks SET status = 'pending' WHERE status = 'processing'")
+        conn.execute("UPDATE sessions SET analysis_status = NULL WHERE analysis_status = 'running'")
+
+
+def set_chunk_transcribed(chunk_id: str, transcript_path: str):
+    with db_cursor() as conn:
+        conn.execute(
+            "UPDATE chunks SET status = 'transcribed', error_msg = NULL, transcript_path = ? WHERE id = ?",
+            (transcript_path, chunk_id)
+        )
 
 
 def update_chunk_status(chunk_id: str, status: str, error_msg: str | None = None):
@@ -204,19 +266,17 @@ def update_chunk_duration(chunk_id: str, duration_ms: int):
         conn.execute("UPDATE chunks SET duration_ms = ? WHERE id = ?", (duration_ms, chunk_id))
 
 
-def replace_chunk_segments(chunk_id: str, session_id: str, segments: list[dict]):
-    """Swap in a chunk's segments atomically, so reprocessing never leaves duplicates."""
+def replace_session_segments(session_id: str, segments: list[dict]):
+    """Swap in a session's segments (session-relative times) atomically, replacing any earlier
+    analysis, including rows from the per-chunk pipeline."""
     with db_cursor() as conn:
-        conn.execute(
-            "DELETE FROM classified_segments WHERE chunk_id = ? OR (chunk_id IS NULL AND id LIKE ?)",
-            (chunk_id, f"{chunk_id}_seg_%")
-        )
+        conn.execute("DELETE FROM classified_segments WHERE session_id = ?", (session_id,))
         conn.executemany(
             """INSERT INTO classified_segments (id, session_id, chunk_id, start_ms, end_ms, category,
-               summary, inferred_deadline, source_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               summary, inferred_deadline, source_text, speaker_role) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)""",
             [
-                (f"{chunk_id}_seg_{i}", session_id, chunk_id, s["start_ms"], s["end_ms"], s["category"],
-                 s.get("summary"), s.get("inferred_deadline"), s["source_text"])
+                (f"{session_id}_span_{i}", session_id, s["start_ms"], s["end_ms"], s["category"],
+                 s.get("summary"), s.get("inferred_deadline"), s["source_text"], s.get("speaker_role"))
                 for i, s in enumerate(segments)
             ]
         )

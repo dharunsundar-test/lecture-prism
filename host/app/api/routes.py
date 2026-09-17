@@ -9,11 +9,11 @@ from pathlib import Path
 from app.core.config import settings
 from app.core.pairing import require_phone_or_local
 from app.db.database import (
-    ensure_session, finalize_session, refresh_session_status, upsert_chunk, get_chunk,
+    ensure_session, finalize_session, refresh_session_status, reprocess_session, upsert_chunk, get_chunk,
     get_session, get_sessions, get_chunks, get_segments, save_notes, get_notes
 )
 from app.services.audio import build_session_audio, chunk_offsets
-from app.services.notes import NotesError, generate_documents
+from app.services.notes import NotesError, generate_documents, parse_note_items
 
 health_router = APIRouter()
 router = APIRouter(prefix="/api", dependencies=[Depends(require_phone_or_local)])
@@ -41,6 +41,7 @@ class SegmentResponse(BaseModel):
     summary: Optional[str]
     inferred_deadline: Optional[int]
     source_text: str
+    speaker_role: Optional[str] = None
 
 
 class SessionResponse(BaseModel):
@@ -50,6 +51,8 @@ class SessionResponse(BaseModel):
     ended_at: Optional[int]
     expected_chunks: Optional[int]
     status: str
+    analysis_status: Optional[str]
+    error_msg: Optional[str]
     chunks: list
 
 
@@ -151,6 +154,8 @@ def _session_response(session: dict) -> SessionResponse:
         ended_at=session["ended_at"],
         expected_chunks=session["expected_chunks"],
         status=session["status"],
+        analysis_status=session["analysis_status"],
+        error_msg=session["error_msg"],
         chunks=get_chunks(session["id"])
     )
 
@@ -172,14 +177,24 @@ def get_session_detail(session_id: str):
     return _session_response(_require_session(session_id))
 
 
+@router.post("/sessions/{session_id}/reprocess", response_model=SessionResponse)
+def reprocess(session_id: str):
+    """Retry failed chunks and redo the session analysis, e.g. after starting Ollama."""
+    _require_session(session_id)
+    reprocess_session(session_id)
+    refresh_session_status(session_id)
+    return _session_response(get_session(session_id))
+
+
 def session_segments(session_id: str) -> list[dict]:
-    """Segments with start/end converted from chunk time to session time."""
+    """Segments on the session timeline. Session-level analysis stores them that way already;
+    rows from the earlier per-chunk pipeline are converted from chunk time."""
     offsets = chunk_offsets(get_chunks(session_id))
     result = []
     for seg in get_segments(session_id):
-        # Rows written before chunk_id existed encode it in the segment id.
-        chunk_id = seg.get("chunk_id") or seg["id"].rsplit("_seg_", 1)[0]
-        offset = offsets.get(chunk_id, 0)
+        # Per-chunk rows written before chunk_id existed encode it in the segment id.
+        chunk_id = seg.get("chunk_id") or (seg["id"].rsplit("_seg_", 1)[0] if "_seg_" in seg["id"] else None)
+        offset = offsets.get(chunk_id, 0) if chunk_id else 0
         result.append({**seg, "start_ms": seg["start_ms"] + offset, "end_ms": seg["end_ms"] + offset})
     return sorted(result, key=lambda s: s["start_ms"])
 
@@ -217,10 +232,16 @@ def get_chunk_audio(session_id: str, chunk_seq: int):
     return FileResponse(audio_path, media_type="audio/mp4", filename=f"chunk_{chunk_seq}.m4a")
 
 
+def _notes_response(session_id: str) -> NotesResponse:
+    return NotesResponse(documents=[
+        {**doc, "items": parse_note_items(doc["content"])} for doc in get_notes(session_id)
+    ])
+
+
 @router.get("/sessions/{session_id}/notes", response_model=NotesResponse)
 def list_notes(session_id: str):
     _require_session(session_id)
-    return NotesResponse(documents=get_notes(session_id))
+    return _notes_response(session_id)
 
 
 @router.post("/sessions/{session_id}/notes", response_model=NotesResponse)
@@ -236,4 +257,4 @@ def generate_notes(session_id: str, request: NotesRequest):
         raise HTTPException(502, str(e))
 
     save_notes(session_id, documents)
-    return NotesResponse(documents=get_notes(session_id))
+    return _notes_response(session_id)
