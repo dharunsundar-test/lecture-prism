@@ -5,7 +5,10 @@ export interface Session {
   ended_at: number | null;
   /** Set once the phone finalizes the session; null while still recording or uploading. */
   expected_chunks: number | null;
-  status: string;
+  status: 'capturing' | 'processing' | 'done' | 'failed';
+  /** null = waiting for every chunk to be transcribed; then 'running' | 'done' | 'failed'. */
+  analysis_status: 'running' | 'done' | 'failed' | null;
+  error_msg: string | null;
   chunks: Chunk[];
 }
 
@@ -31,6 +34,7 @@ export interface Segment {
   summary: string | null;
   inferred_deadline: number | null;
   source_text: string;
+  speaker_role: 'lecturer' | 'other' | null;
 }
 
 export type Category = 'concept' | 'example' | 'announcement' | 'qa' | 'action_item' | 'filler';
@@ -40,8 +44,16 @@ export interface NotesDocument {
   session_id: string;
   type: 'concepts' | 'examples' | 'announcements' | 'qa';
   content: string;
+  /** content split into lines, with each line's [m:ss] timestamp parsed out by the host. */
+  items: NoteItem[];
   generated_at: number;
   model: 'local' | 'groq';
+}
+
+export interface NoteItem {
+  kind: 'heading' | 'item' | 'text';
+  text: string;
+  start_ms: number | null;
 }
 
 export const CATEGORY_COLORS: Record<Category, string> = {

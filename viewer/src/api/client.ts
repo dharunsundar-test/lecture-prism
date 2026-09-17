@@ -21,6 +21,11 @@ export async function fetchSegments(sessionId: string): Promise<Segment[]> {
   return data;
 }
 
+export async function reprocessSession(sessionId: string): Promise<Session> {
+  const { data } = await api.post(`/sessions/${sessionId}/reprocess`);
+  return data;
+}
+
 export async function fetchNotes(sessionId: string): Promise<NotesDocument[]> {
   const { data } = await api.get(`/sessions/${sessionId}/notes`);
   return data.documents;
