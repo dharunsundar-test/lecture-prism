@@ -1,60 +1,99 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Alert, ActivityIndicator } from 'react-native';
-import QRCodeScanner from 'react-native-qrcode-scanner';
-import { transferService } from '../services/transfer';
+import React, { useState } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Alert, TextInput, ScrollView } from 'react-native';
+import { PairingError, transferService } from '../services/transfer';
+import { qrScanner } from '../services/nativeModules';
+import { PCConfig } from '../types';
 
 interface QRPairingScreenProps {
-  onPaired: (ip: string, port: number) => void;
+  onPaired: (config: PCConfig) => void;
   onCancel: () => void;
 }
 
+/** Parses the host's /api/pair QR payload: {"ips": [...], "port": 8000, "token": "..."}. */
+function parsePairingPayload(text: string): PCConfig | null {
+  try {
+    const data = JSON.parse(text);
+    const ips: unknown = data.ips ?? (data.ip ? [data.ip] : []);
+    if (!Array.isArray(ips) || ips.length === 0 || typeof data.token !== 'string' || !data.port) {
+      return null;
+    }
+    return { ips: ips.map(String), port: Number(data.port), token: data.token, pairedAt: Date.now() };
+  } catch {
+    return null;
+  }
+}
+
 export const QRPairingScreen: React.FC<QRPairingScreenProps> = ({ onPaired, onCancel }) => {
-  const [hasPermission, setHasPermission] = useState<boolean | null>(null);
-  const [scanning, setScanning] = useState(true);
-  const [flashOn, setFlashOn] = useState(false);
-  const scannerRef = useRef<QRCodeScanner>(null);
+  const [busy, setBusy] = useState(false);
+  const [ip, setIp] = useState('');
+  const [port, setPort] = useState('8000');
+  const [token, setToken] = useState('');
 
-  useEffect(() => {
-    setHasPermission(null);
-    setScanning(true);
-  }, []);
-
-  const onSuccess = (e: { data: string }) => {
-    if (!scanning) return;
-
+  const pair = async (config: PCConfig) => {
+    setBusy(true);
     try {
-      const config = JSON.parse(e.data);
-      if (config.ip && config.port) {
-        setScanning(false);
-        transferService.setPCConfig({ ip: config.ip, port: config.port, pairedAt: Date.now() });
-        onPaired(config.ip, config.port);
+      const reachableIp = await transferService.findReachableIp(config);
+      const paired = { ...config, lastReachableIp: reachableIp };
+      await transferService.setPCConfig(paired);
+      onPaired(paired);
+    } catch (error) {
+      if (error instanceof PairingError && error.reason === 'unreachable') {
+        // Pairing while away from the PC's network is legitimate; uploads start once it's reachable.
+        Alert.alert('PC not reachable right now', `${error.message}\n\nSave the pairing anyway?`, [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Save anyway',
+            onPress: async () => {
+              await transferService.setPCConfig(config);
+              onPaired(config);
+            },
+          },
+        ]);
       } else {
-        Alert.alert('Invalid QR Code', 'QR code does not contain valid PC configuration');
-        setScanning(true);
+        Alert.alert('Pairing failed', error instanceof Error ? error.message : String(error));
       }
-    } catch {
-      Alert.alert('Invalid QR Code', 'Could not parse QR code data');
-      setScanning(true);
+    } finally {
+      setBusy(false);
     }
   };
 
-  const toggleFlash = () => {
-    setFlashOn((prev) => !prev);
+  const handleScan = async () => {
+    let text: string | null;
+    try {
+      text = await qrScanner.scan();
+    } catch (error) {
+      Alert.alert(
+        'Scanner unavailable',
+        `${error instanceof Error ? error.message : String(error)}\n\nEnter the details from the pairing page instead.`,
+      );
+      return;
+    }
+    if (text === null) {
+      return;
+    }
+    const config = parsePairingPayload(text);
+    if (!config) {
+      Alert.alert('Invalid QR Code', 'Scan the code on the PC pairing page (http://localhost:8000/api/pair).');
+      return;
+    }
+    await pair(config);
   };
 
-  if (hasPermission === false) {
-    return (
-      <View style={styles.container}>
-        <Text style={styles.errorText}>Camera permission denied</Text>
-        <TouchableOpacity style={styles.button} onPress={onCancel}>
-          <Text style={styles.buttonText}>Go Back</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
+  const handleManualPair = async () => {
+    if (!ip.trim() || !token.trim()) {
+      Alert.alert('Missing details', 'Enter the IP address and pair token shown on the PC pairing page.');
+      return;
+    }
+    await pair({
+      ips: [ip.trim()],
+      port: parseInt(port, 10) || 8000,
+      token: token.trim(),
+      pairedAt: Date.now(),
+    });
+  };
 
   return (
-    <View style={styles.container}>
+    <ScrollView style={styles.container} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
       <View style={styles.header}>
         <TouchableOpacity style={styles.closeButton} onPress={onCancel}>
           <Text style={styles.closeText}>✕</Text>
@@ -62,122 +101,84 @@ export const QRPairingScreen: React.FC<QRPairingScreenProps> = ({ onPaired, onCa
       </View>
 
       <Text style={styles.title}>Pair with PC</Text>
-      <Text style={styles.subtitle}>Scan the QR code shown on your desktop app</Text>
+      <Text style={styles.subtitle}>
+        On the PC, open http://localhost:8000/api/pair and scan the code shown there.
+      </Text>
 
-      <View style={styles.scannerContainer}>
-        {hasPermission === null ? (
-          <View style={styles.loadingContainer}>
-            <ActivityIndicator size="large" />
-            <Text style={styles.loadingText}>Requesting camera permission...</Text>
-          </View>
-        ) : (
-          <QRCodeScanner
-            ref={scannerRef}
-            onRead={onSuccess}
-            flashMode={flashOn ? 'on' : 'off'}
-            topContent={
-              <View style={styles.flashButtonContainer}>
-                <TouchableOpacity style={styles.flashButton} onPress={toggleFlash}>
-                  <Text style={styles.flashButtonText}>{flashOn ? 'Flash: ON' : 'Flash: OFF'}</Text>
-                </TouchableOpacity>
-              </View>
-            }
-            bottomContent={
-              <TouchableOpacity style={styles.cancelButton} onPress={onCancel}>
-                <Text style={styles.cancelButtonText}>Cancel</Text>
-              </TouchableOpacity>
-            }
-            cameraStyle={styles.scanner}
-            showMarker={true}
-            customMarker={null}
-          />
-        )}
-      </View>
+      <TouchableOpacity style={[styles.button, busy && styles.buttonDisabled]} onPress={handleScan} disabled={busy}>
+        <Text style={styles.buttonText}>{busy ? 'Connecting...' : 'Scan QR code'}</Text>
+      </TouchableOpacity>
 
       <View style={styles.manualEntry}>
         <Text style={styles.manualLabel}>Or enter manually:</Text>
-        <ManualEntryForm onSubmit={onPaired} onCancel={onCancel} />
+        <View style={styles.inputRow}>
+          <Text style={styles.inputLabel}>IP Address</Text>
+          <TextInput
+            style={styles.input}
+            value={ip}
+            onChangeText={setIp}
+            placeholder="192.168.x.x"
+            placeholderTextColor="#475569"
+            keyboardType="decimal-pad"
+            autoCorrect={false}
+          />
+        </View>
+        <View style={styles.inputRow}>
+          <Text style={styles.inputLabel}>Port</Text>
+          <TextInput
+            style={styles.input}
+            value={port}
+            onChangeText={setPort}
+            placeholder="8000"
+            placeholderTextColor="#475569"
+            keyboardType="numeric"
+          />
+        </View>
+        <View style={styles.inputRow}>
+          <Text style={styles.inputLabel}>Token</Text>
+          <TextInput
+            style={styles.input}
+            value={token}
+            onChangeText={setToken}
+            placeholder="From the pairing page"
+            placeholderTextColor="#475569"
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+        </View>
+        <TouchableOpacity
+          style={[styles.button, styles.secondaryButton, busy && styles.buttonDisabled]}
+          onPress={handleManualPair}
+          disabled={busy}
+        >
+          <Text style={styles.buttonText}>{busy ? 'Testing...' : 'Test & Pair'}</Text>
+        </TouchableOpacity>
       </View>
-    </View>
-  );
-};
 
-const ManualEntryForm: React.FC<{
-  onSubmit: (ip: string, port: number) => void;
-  onCancel: () => void;
-}> = ({ onSubmit, onCancel }) => {
-  const [ip, setIp] = useState('');
-  const [port, setPort] = useState('8000');
-  const [testing, setTesting] = useState(false);
-
-  const handleTest = async () => {
-    if (!ip) return;
-    setTesting(true);
-    try {
-      await transferService.setPCConfig({ ip, port: parseInt(port, 10), pairedAt: Date.now() });
-      onSubmit(ip, parseInt(port, 10));
-    } catch {
-      Alert.alert('Connection Failed', 'Could not reach PC at this address');
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  return (
-    <View style={styles.manualForm}>
-      <View style={styles.inputRow}>
-        <Text style={styles.inputLabel}>IP Address</Text>
-        <TextInput
-          style={styles.input}
-          value={ip}
-          onChangeText={setIp}
-          placeholder="192.168.x.x"
-          keyboardType="decimal-pad"
-        />
-      </View>
-      <View style={styles.inputRow}>
-        <Text style={styles.inputLabel}>Port</Text>
-        <TextInput
-          style={styles.input}
-          value={port}
-          onChangeText={setPort}
-          placeholder="8000"
-          keyboardType="numeric"
-        />
-      </View>
-      <TouchableOpacity style={[styles.button, testing && styles.buttonDisabled]} onPress={handleTest} disabled={testing}>
-        <Text style={styles.buttonText}>{testing ? 'Testing...' : 'Test & Pair'}</Text>
+      <TouchableOpacity style={styles.cancelButton} onPress={onCancel}>
+        <Text style={styles.cancelButtonText}>Cancel</Text>
       </TouchableOpacity>
-    </View>
+    </ScrollView>
   );
 };
-
-import { TextInput } from 'react-native';
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0F172A' },
-  header: { padding: 16, alignItems: 'flex-end' },
+  content: { paddingHorizontal: 16, paddingBottom: 32 },
+  header: { paddingVertical: 16, alignItems: 'flex-end' },
   closeButton: { padding: 8 },
   closeText: { fontSize: 24, color: '#94A3B8' },
   title: { fontSize: 28, fontWeight: '700', color: '#F8FAFC', textAlign: 'center', marginTop: 8 },
-  subtitle: { fontSize: 16, color: '#64748B', textAlign: 'center', marginBottom: 24 },
-  scannerContainer: { flex: 1, marginHorizontal: 16, borderRadius: 12, overflow: 'hidden' },
-  scanner: { width: '100%', height: '100%' },
-  flashButtonContainer: { alignItems: 'center', padding: 12 },
-  flashButton: { backgroundColor: 'rgba(15, 23, 42, 0.8)', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20 },
-  flashButtonText: { color: '#F8FAFC', fontSize: 14 },
-  cancelButton: { alignSelf: 'center', marginBottom: 16, paddingHorizontal: 24, paddingVertical: 12 },
+  subtitle: { fontSize: 16, color: '#64748B', textAlign: 'center', marginTop: 8, marginBottom: 24 },
+  cancelButton: { alignSelf: 'center', marginTop: 16, paddingHorizontal: 24, paddingVertical: 12 },
   cancelButtonText: { color: '#94A3B8', fontSize: 16 },
-  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  loadingText: { color: '#94A3B8', marginTop: 12, fontSize: 16 },
-  manualEntry: { padding: 16, borderTopWidth: 1, borderTopColor: '#1E293B' },
-  manualLabel: { color: '#94A3B8', fontSize: 14, marginBottom: 12, textAlign: 'center' },
-  manualForm: { gap: 12 },
+  manualEntry: { marginTop: 32, paddingTop: 16, borderTopWidth: 1, borderTopColor: '#1E293B', gap: 12 },
+  manualLabel: { color: '#94A3B8', fontSize: 14, textAlign: 'center' },
   inputRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   inputLabel: { color: '#E2E8F0', fontSize: 16, width: 80 },
   input: { flex: 1, backgroundColor: '#1E293B', color: '#F8FAFC', padding: 12, borderRadius: 8, fontSize: 16 },
   button: { backgroundColor: '#2563EB', paddingVertical: 14, borderRadius: 8, alignItems: 'center', marginTop: 8 },
+  secondaryButton: { backgroundColor: '#1E40AF' },
   buttonDisabled: { backgroundColor: '#1E3A5F' },
   buttonText: { color: '#F8FAFC', fontSize: 16, fontWeight: '600' },
-  errorText: { color: '#EF4444', fontSize: 16, textAlign: 'center', marginBottom: 16 },
 });

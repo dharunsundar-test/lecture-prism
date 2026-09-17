@@ -11,7 +11,6 @@ export interface RecordingSession {
   endedAt?: number;
   duration?: number;
   status: 'recording' | 'paused' | 'completed' | 'failed';
-  chunks: Chunk[];
 }
 
 export interface Chunk {
@@ -29,20 +28,28 @@ export interface Chunk {
 }
 
 export interface PCConfig {
-  ip: string;
+  /** Every LAN address the PC reported; its IP differs between Wi-Fi and a phone hotspot. */
+  ips: string[];
   port: number;
+  token: string;
   pairedAt: number;
+  lastReachableIp?: string;
 }
 
-export interface TransferQueueItem {
-  chunkId: string;
+interface QueueItemBase {
   sessionId: string;
-  filePath: string;
   attempts: number;
-  lastAttempt?: number;
+  nextAttemptAt: number;
+  lastError?: string;
 }
+
+export type TransferQueueItem =
+  | (QueueItemBase & { kind: 'chunk'; chunkId: string })
+  | (QueueItemBase & { kind: 'finalize'; endedAt: number; chunkCount: number });
+
+export type ConnectionState = 'unpaired' | 'searching' | 'connected' | 'unreachable' | 'unauthorized';
 
 export const CHUNK_DURATION_MS = 5 * 60 * 1000;
-export const MAX_RETRIES = 5;
-export const RETRY_BASE_DELAY_MS = 30000;
 export const PING_INTERVAL_MS = 30000;
+export const RETRY_BASE_DELAY_MS = 5000;
+export const RETRY_MAX_DELAY_MS = 5 * 60 * 1000;
