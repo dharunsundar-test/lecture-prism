@@ -70,7 +70,12 @@ npm install
 npx react-native run-android
 ```
 Recording runs in an Android foreground service (`android/.../recorder/RecorderService.kt`), so it
-continues with the screen off. iOS recording is not implemented yet.
+continues with the screen off.
+
+On iOS the recorder is a local native module (`modules/lecture-capture-ios`, linked by
+`react-native.config.js`); run `cd ios && pod install` before `npx react-native run-ios`. It uses the
+`audio` background mode to keep recording with the screen locked, and stops (saving what it has) if a
+call interrupts. QR scanning isn't available on iOS yet: pair with the manual IP/port/token fields.
 
 ## QR Pairing
 Open http://localhost:8000/api/pair on the PC (or **Pair phone** in the viewer). It shows a QR code with:
@@ -86,17 +91,31 @@ Recordings stay queued on the phone and upload when the PC is reachable. If the 
 allow inbound TCP 8000 for Python in Windows Defender Firewall.
 
 ## Processing Pipeline
+Per chunk, as soon as it arrives:
 1. **Noise Reduction** - ffmpeg highpass/lowpass + anlmdn
-2. **Transcription** - faster-whisper (GPU: large-v3, CPU: medium)
-3. **Speaker Detection** - Heuristic (long segments = lecturer)
-4. **Classification** - 6 categories via Ollama/Groq:
+2. **Transcription** - faster-whisper (GPU: large-v3, CPU: medium), saved to `data/transcripts/`
+   with a loudness (dBFS) value per segment
+
+Per session, once the phone has finalized it and every chunk is transcribed:
+
+3. **Speaker Roles** - segments are split into two loudness levels; the level with the most speaking
+   time is the lecturer, so it works whether the phone is near the lecturer or the students. Falls back
+   to a timing heuristic when there's only one level.
+4. **Classification** - the whole session transcript is classified by the local Ollama model in ~3-minute
+   windows (with 30 s of context), so topics that cross a chunk boundary stay together. Each span gets a
+   category and a one-line summary:
    - `concept` - Definitions, explanations
    - `example` - Worked problems, demos
    - `announcement` - Quiz/exam dates, deadlines
    - `qa` - Questions & answers
    - `action_item` - Assignments, tasks
    - `filler` - Silence, irrelevant
-5. **Notes Generation** - Per-category documents (local or Groq)
+
+   Deadlines are resolved against the lecture date ("next Tuesday" -> an absolute date).
+5. **Notes Generation** - On demand from the viewer, per-category documents (local or Groq). Every bullet
+   carries a `[m:ss]` timestamp, so the viewer highlights the note being played and seeks when clicked.
+
+If a step fails (e.g. Ollama isn't running), the session shows the error and a **Retry processing** button.
 
 ## Configuration
 
@@ -155,11 +174,12 @@ Requests from other machines need `X-Pair-Token`; requests from the PC itself (t
 | POST | `/api/chunks/upload` | Upload audio chunk (idempotent; optional `sha256`) |
 | POST | `/api/sessions/{id}/finalize` | Phone stopped recording: sets end time and expected chunk count |
 | GET | `/api/sessions` | List all sessions |
-| GET | `/api/sessions/{id}` | Session detail |
+| GET | `/api/sessions/{id}` | Session detail (status, analysis status, error) |
+| POST | `/api/sessions/{id}/reprocess` | Retry failed chunks/analysis; finalizes a session the phone never finalized |
 | GET | `/api/sessions/{id}/segments` | Classified segments (session-relative times) |
 | GET | `/api/sessions/{id}/audio/{seq}` | Chunk audio file |
 | GET | `/api/sessions/{id}/audio/full` | Full session audio (chunks joined with ffmpeg) |
-| GET | `/api/sessions/{id}/notes` | Saved notes |
+| GET | `/api/sessions/{id}/notes` | Saved notes, with `items` (lines and their `start_ms`) |
 | POST | `/api/sessions/{id}/notes` | Generate and save notes (`{"model": "local" \| "groq"}`) |
 
 ## Development Notes

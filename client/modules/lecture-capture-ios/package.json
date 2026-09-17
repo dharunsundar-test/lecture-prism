@@ -1,0 +1,6 @@
+{
+  "name": "lecture-capture-ios",
+  "version": "0.0.1",
+  "private": true,
+  "description": "iOS native recorder for the Lecture Capture app, autolinked from client/react-native.config.js"
+}
