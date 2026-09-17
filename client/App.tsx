@@ -1,12 +1,12 @@
 import React from 'react';
-import { StatusBar, SafeAreaView, StyleSheet } from 'react-native';
-import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { StatusBar, StyleSheet } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { RecordingScreen } from './src/screens/RecordingScreen';
 
 const App: React.FC = () => {
   return (
     <SafeAreaProvider>
-      <StatusBar barStyle="light-content" backgroundColor="#0F172A" />
+      <StatusBar barStyle="light-content" />
       <SafeAreaView style={styles.container}>
         <RecordingScreen />
       </SafeAreaView>

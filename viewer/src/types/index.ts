@@ -3,6 +3,8 @@ export interface Session {
   course_tag: string;
   started_at: number;
   ended_at: number | null;
+  /** Set once the phone finalizes the session; null while still recording or uploading. */
+  expected_chunks: number | null;
   status: string;
   chunks: Chunk[];
 }

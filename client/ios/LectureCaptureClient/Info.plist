@@ -36,6 +36,16 @@
 	</dict>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string></string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Lecture Capture records lectures so it can transcribe them into notes.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>The camera is used to scan the pairing QR code shown on your PC.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Recordings are sent directly to your PC over the local network.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIRequiredDeviceCapabilities</key>

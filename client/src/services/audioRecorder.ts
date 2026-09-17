@@ -1,10 +1,8 @@
-import AudioRecorderPlayer from 'react-native-audio-recorder-player';
 import { Platform, PermissionsAndroid } from 'react-native';
-import RNFS from 'react-native-fs';
-import { storage, CHUNK_DURATION_MS } from '../storage';
-import { Chunk, RecordingSession } from '../types';
-
-const audioRecorderPlayer = new AudioRecorderPlayer();
+import { storage } from '../storage';
+import { CHUNK_DURATION_MS, RecordingSession } from '../types';
+import { nativeRecorder, NativeChunkEvent } from './nativeModules';
+import { transferService } from './transfer';
 
 export interface RecordingState {
   isRecording: boolean;
@@ -14,19 +12,34 @@ export interface RecordingState {
 }
 
 type RecordingCallback = (state: RecordingState) => void;
+type ErrorCallback = (message: string) => void;
 
+const IDLE_STATE: RecordingState = {
+  isRecording: false,
+  currentTime: 0,
+  currentChunk: 0,
+  sessionId: null,
+};
+
+/**
+ * Coordinates the native recorder (which writes the chunk files) with local storage and the
+ * upload queue. Chunk rotation happens natively so it keeps working in the background; this
+ * class records each finished chunk and queues it for upload.
+ */
 class AudioRecorderService {
   private callbacks: Set<RecordingCallback> = new Set();
-  private state: RecordingState = {
-    isRecording: false,
-    currentTime: 0,
-    currentChunk: 0,
-    sessionId: null,
-  };
-  private chunkTimer: ReturnType<typeof setTimeout> | null = null;
+  private errorCallbacks: Set<ErrorCallback> = new Set();
+  private state: RecordingState = { ...IDLE_STATE };
   private session: RecordingSession | null = null;
-  private chunkStartTime = 0;
-  private currentChunkPath = '';
+  private nextSeq = 0;
+  private elapsedBeforeResume = 0;
+  private resumedAt = 0;
+  private tickTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor() {
+    nativeRecorder.onChunk((event) => this.handleChunk(event));
+    nativeRecorder.onError((message) => this.handleNativeError(message));
+  }
 
   subscribe(cb: RecordingCallback): () => void {
     this.callbacks.add(cb);
@@ -34,202 +47,118 @@ class AudioRecorderService {
     return () => this.callbacks.delete(cb);
   }
 
-  private notify(): void {
-    this.callbacks.forEach((cb) => cb(this.state));
+  onError(cb: ErrorCallback): () => void {
+    this.errorCallbacks.add(cb);
+    return () => this.errorCallbacks.delete(cb);
   }
 
-  private async requestPermission(): Promise<boolean> {
-    if (Platform.OS === 'android') {
-      const granted = await PermissionsAndroid.request(
-        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-        {
-          title: 'Microphone Permission',
-          message: 'Lecture Capture needs microphone access to record lectures',
-          buttonNeutral: 'Ask Me Later',
-          buttonNegative: 'Cancel',
-          buttonPositive: 'OK',
-        }
-      );
-      return granted === PermissionsAndroid.RESULTS.GRANTED;
+  private notify(): void {
+    const snapshot = { ...this.state };
+    this.callbacks.forEach((cb) => cb(snapshot));
+  }
+
+  private async requestPermissions(): Promise<void> {
+    if (Platform.OS !== 'android') {
+      return;
     }
-    return true;
+    const mic = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO, {
+      title: 'Microphone Permission',
+      message: 'Lecture Capture needs microphone access to record lectures',
+      buttonPositive: 'OK',
+    });
+    if (mic !== PermissionsAndroid.RESULTS.GRANTED) {
+      throw new Error('Microphone permission denied');
+    }
+    if (Number(Platform.Version) >= 33) {
+      // Optional: without it the recording notification is hidden, but recording still works.
+      await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+    }
   }
 
   async startRecording(courseId: string): Promise<RecordingSession> {
-    const hasPermission = await this.requestPermission();
-    if (!hasPermission) {
-      throw new Error('Microphone permission denied');
+    if (this.session) {
+      throw new Error('A recording is already in progress');
     }
+    if (!nativeRecorder.isAvailable()) {
+      throw new Error(`Recording is not supported on ${Platform.OS} yet`);
+    }
+    await this.requestPermissions();
 
-    this.session = await storage.createSessionMetadata(courseId);
-    this.state = {
-      isRecording: true,
-      currentTime: 0,
-      currentChunk: 0,
-      sessionId: this.session.id,
-    };
-    this.notify();
-
-    await this.startNewChunk();
-    this.startChunkTimer();
-
-    return this.session;
-  }
-
-  private async startNewChunk(): Promise<void> {
-    if (!this.session) return;
-
-    const seq = this.state.currentChunk;
-    const dir = await storage.getSessionDir(this.session.id);
-    this.currentChunkPath = `${dir}/chunk_${seq}.m4a`;
-    this.chunkStartTime = Date.now();
-
-    await audioRecorderPlayer.startRecorder(this.currentChunkPath, {
-      SampleRate: 44100,
-      Channels: 1,
-      AudioQuality: 'High',
-      AudioEncoding: 'aac',
-      MeteringEnabled: false,
-    });
-  }
-
-  private startChunkTimer(): void {
-    this.chunkTimer = setTimeout(() => this.rotateChunk(), CHUNK_DURATION_MS);
-  }
-
-  private async rotateChunk(): Promise<void> {
-    if (!this.session || !this.state.isRecording) return;
-
-    await audioRecorderPlayer.stopRecorder();
-    const chunkEndTime = Date.now();
-    const duration = chunkEndTime - this.chunkStartTime;
-
+    const session = storage.createSessionMetadata(courseId);
+    await storage.upsertSession(session);
     try {
-      const stat = await RNFS.stat(this.currentChunkPath);
-      const chunk = await storage.createChunkMetadata(
-        this.session.id,
-        this.state.currentChunk,
-        this.currentChunkPath,
-        duration,
-        stat.size,
-        this.chunkStartTime,
-        chunkEndTime
-      );
-
-      this.session.chunks.push(chunk);
-      await storage.saveSessions([this.session, ...(await storage.getSessions()).filter(s => s.id !== this.session!.id)]);
-      await storage.saveChunks([chunk, ...(await storage.getChunks())]);
-
-      this.state.currentChunk += 1;
-      this.notify();
-
-      await this.startNewChunk();
-      this.startChunkTimer();
+      await nativeRecorder.start(session.id, await storage.getSessionDir(session.id), CHUNK_DURATION_MS, 0);
     } catch (error) {
-      console.error('Failed to finalize chunk:', error);
+      await storage.upsertSession({ ...session, status: 'failed' });
+      throw error;
     }
+
+    this.session = session;
+    this.nextSeq = 0;
+    this.elapsedBeforeResume = 0;
+    this.state = { isRecording: true, currentTime: 0, currentChunk: 0, sessionId: session.id };
+    this.startTicking();
+    this.notify();
+    return session;
   }
 
   async pauseRecording(): Promise<void> {
-    if (!this.state.isRecording || !this.session) return;
-
-    if (this.chunkTimer) {
-      clearTimeout(this.chunkTimer);
-      this.chunkTimer = null;
+    if (!this.state.isRecording || !this.session) {
+      return;
     }
+    // Pausing closes the current chunk; resuming starts the next sequence number.
+    this.nextSeq = Math.max(this.nextSeq, await nativeRecorder.stop());
+    this.stopTicking();
 
-    await audioRecorderPlayer.stopRecorder();
-    const chunkEndTime = Date.now();
-    const duration = chunkEndTime - this.chunkStartTime;
-
-    try {
-      const stat = await RNFS.stat(this.currentChunkPath);
-      const chunk = await storage.createChunkMetadata(
-        this.session.id,
-        this.state.currentChunk,
-        this.currentChunkPath,
-        duration,
-        stat.size,
-        this.chunkStartTime,
-        chunkEndTime
-      );
-
-      this.session.chunks.push(chunk);
-      this.session.status = 'paused';
-      await storage.saveSessions([this.session, ...(await storage.getSessions()).filter(s => s.id !== this.session.id)]);
-      await storage.saveChunks([chunk, ...(await storage.getChunks())]);
-    } catch (error) {
-      console.error('Failed to pause recording:', error);
-    }
-
-    this.state.isRecording = false;
+    this.session = { ...this.session, status: 'paused' };
+    await storage.upsertSession(this.session);
+    this.state = { ...this.state, isRecording: false, currentChunk: this.nextSeq };
     this.notify();
   }
 
   async resumeRecording(): Promise<void> {
-    if (this.state.isRecording || !this.session) return;
-
-    const hasPermission = await this.requestPermission();
-    if (!hasPermission) {
-      throw new Error('Microphone permission denied');
+    if (this.state.isRecording || !this.session) {
+      return;
     }
+    await this.requestPermissions();
+    await nativeRecorder.start(
+      this.session.id,
+      await storage.getSessionDir(this.session.id),
+      CHUNK_DURATION_MS,
+      this.nextSeq,
+    );
 
-    this.session.status = 'recording';
-    this.state.isRecording = true;
+    this.session = { ...this.session, status: 'recording' };
+    await storage.upsertSession(this.session);
+    this.state = { ...this.state, isRecording: true };
+    this.startTicking();
     this.notify();
-
-    await this.startNewChunk();
-    this.startChunkTimer();
   }
 
   async stopRecording(): Promise<RecordingSession | null> {
-    if (!this.session) return null;
-
-    if (this.chunkTimer) {
-      clearTimeout(this.chunkTimer);
-      this.chunkTimer = null;
+    if (!this.session) {
+      return null;
     }
-
     if (this.state.isRecording) {
-      await audioRecorderPlayer.stopRecorder();
-      const chunkEndTime = Date.now();
-      const duration = chunkEndTime - this.chunkStartTime;
-
-      try {
-        const stat = await RNFS.stat(this.currentChunkPath);
-        const chunk = await storage.createChunkMetadata(
-          this.session.id,
-          this.state.currentChunk,
-          this.currentChunkPath,
-          duration,
-          stat.size,
-          this.chunkStartTime,
-          chunkEndTime
-        );
-
-        this.session.chunks.push(chunk);
-        await storage.saveChunks([chunk, ...(await storage.getChunks())]);
-      } catch (error) {
-        console.error('Failed to finalize last chunk:', error);
-      }
+      this.nextSeq = Math.max(this.nextSeq, await nativeRecorder.stop());
+      this.stopTicking();
     }
 
-    this.session.endedAt = Date.now();
-    this.session.duration = this.session.endedAt - this.session.startedAt;
-    this.session.status = 'completed';
-    await storage.saveSessions([this.session, ...(await storage.getSessions()).filter(s => s.id !== this.session.id)]);
-
-    const completedSession = this.session;
-    this.session = null;
-    this.state = {
-      isRecording: false,
-      currentTime: 0,
-      currentChunk: 0,
-      sessionId: null,
+    const endedAt = Date.now();
+    const completed: RecordingSession = {
+      ...this.session,
+      endedAt,
+      duration: this.elapsedBeforeResume,
+      status: 'completed',
     };
-    this.notify();
+    await storage.upsertSession(completed);
+    // Chunk events may still be in flight; the host accepts finalize before or after the last chunk.
+    await transferService.enqueueFinalize(completed, this.nextSeq);
 
-    return completedSession;
+    this.session = null;
+    this.state = { ...IDLE_STATE };
+    this.notify();
+    return completed;
   }
 
   getState(): RecordingState {
@@ -238,6 +167,48 @@ class AudioRecorderService {
 
   getSession(): RecordingSession | null {
     return this.session;
+  }
+
+  private async handleChunk(event: NativeChunkEvent): Promise<void> {
+    this.nextSeq = Math.max(this.nextSeq, event.seq + 1);
+    const chunk = storage.chunkFromRecording(event);
+    if (await storage.addChunk(chunk)) {
+      await transferService.enqueueChunk(chunk);
+    }
+    if (this.session?.id === event.sessionId) {
+      this.state = { ...this.state, currentChunk: this.nextSeq };
+      this.notify();
+    }
+  }
+
+  private async handleNativeError(message: string): Promise<void> {
+    // The service has already stopped and saved whatever it had recorded.
+    if (this.session && this.state.isRecording) {
+      this.stopTicking();
+      this.session = { ...this.session, status: 'paused' };
+      await storage.upsertSession(this.session);
+      this.state = { ...this.state, isRecording: false };
+      this.notify();
+    }
+    this.errorCallbacks.forEach((cb) => cb(message));
+  }
+
+  private startTicking(): void {
+    this.stopTicking();
+    this.resumedAt = Date.now();
+    this.tickTimer = setInterval(() => {
+      this.state = { ...this.state, currentTime: this.elapsedBeforeResume + (Date.now() - this.resumedAt) };
+      this.notify();
+    }, 1000);
+  }
+
+  private stopTicking(): void {
+    if (this.tickTimer) {
+      clearInterval(this.tickTimer);
+      this.tickTimer = null;
+      this.elapsedBeforeResume += Date.now() - this.resumedAt;
+      this.state = { ...this.state, currentTime: this.elapsedBeforeResume };
+    }
   }
 }
 

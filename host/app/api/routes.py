@@ -1,18 +1,25 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Response
+import hashlib
+import os
+import re
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import Optional, List
-import aiofiles
-import uuid
+from typing import Literal, Optional, List
 from pathlib import Path
 from app.core.config import settings
+from app.core.pairing import require_phone_or_local
 from app.db.database import (
-    create_session, create_chunk, update_session_status,
-    get_session, get_sessions, get_chunks, update_chunk_status,
-    get_segments, create_segment
+    ensure_session, finalize_session, refresh_session_status, upsert_chunk, get_chunk,
+    get_session, get_sessions, get_chunks, get_segments, save_notes, get_notes
 )
+from app.services.audio import build_session_audio, chunk_offsets
+from app.services.notes import NotesError, generate_documents
 
-router = APIRouter()
+health_router = APIRouter()
+router = APIRouter(prefix="/api", dependencies=[Depends(require_phone_or_local)])
+
+# Session ids become directory names, so keep them to a safe character set.
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 
 
 class HealthResponse(BaseModel):
@@ -41,103 +48,165 @@ class SessionResponse(BaseModel):
     course_tag: str
     started_at: int
     ended_at: Optional[int]
+    expected_chunks: Optional[int]
     status: str
     chunks: list
 
 
+class FinalizeRequest(BaseModel):
+    ended_at: int
+    chunk_count: int
+    course_tag: str
+    started_at: int
+
+
 class NotesRequest(BaseModel):
-    model: str = "local"
+    model: Literal["local", "groq"] = "local"
 
 
 class NotesResponse(BaseModel):
     documents: List[dict]
 
 
-@router.get("/health", response_model=HealthResponse)
+@health_router.get("/health", response_model=HealthResponse)
 async def health():
     return HealthResponse()
 
 
-@router.post("/api/chunks/upload", response_model=ChunkUploadResponse)
-async def upload_chunk(
+@router.get("/ping", response_model=HealthResponse)
+async def ping():
+    """Like /health, but only succeeds with a valid pair token, so the phone can tell
+    'PC unreachable' apart from 'paired with a different PC'."""
+    return HealthResponse()
+
+
+def _check_session_id(session_id: str):
+    if not SESSION_ID_RE.match(session_id):
+        raise HTTPException(400, "Invalid session id")
+
+
+@router.post("/chunks/upload", response_model=ChunkUploadResponse)
+def upload_chunk(
     audio: UploadFile = File(...),
     session_id: str = Form(...),
-    seq: int = Form(...),
+    seq: int = Form(..., ge=0),
     course_tag: str = Form(...),
     started_at: int = Form(...),
     ended_at: int = Form(...),
+    session_started_at: Optional[int] = Form(None),
+    sha256: Optional[str] = Form(None),
 ):
-    session = get_session(session_id)
-    if not session:
-        create_session(session_id, course_tag, started_at)
+    """Idempotent: the phone retries whenever it doesn't see a response, so the same chunk
+    can arrive more than once."""
+    _check_session_id(session_id)
+    ensure_session(session_id, course_tag, session_started_at or started_at)
 
     chunk_id = f"{session_id}_chunk_{seq}"
     audio_dir = settings.audio_dir / session_id
     audio_dir.mkdir(parents=True, exist_ok=True)
     audio_path = audio_dir / f"chunk_{seq}.m4a"
+    partial_path = audio_dir / f"chunk_{seq}.m4a.partial"
 
-    async with aiofiles.open(audio_path, "wb") as f:
-        content = await audio.read()
-        await f.write(content)
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with open(partial_path, "wb") as out:
+        while block := audio.file.read(1024 * 1024):
+            digest.update(block)
+            out.write(block)
+            size_bytes += len(block)
+    actual_sha = digest.hexdigest()
 
-    duration_ms = ended_at - started_at
-    size_bytes = len(content)
+    if size_bytes == 0 or (sha256 and sha256.lower() != actual_sha):
+        partial_path.unlink(missing_ok=True)
+        raise HTTPException(400, "Empty upload" if size_bytes == 0 else "Checksum mismatch")
 
-    create_chunk(chunk_id, session_id, seq, str(audio_path), duration_ms, size_bytes, started_at, ended_at)
+    existing = get_chunk(chunk_id)
+    if existing and existing["sha256"] == actual_sha and audio_path.exists():
+        # Retry of a chunk we already have: don't touch the file, it may be mid-processing.
+        partial_path.unlink(missing_ok=True)
+        return ChunkUploadResponse(chunk_id=chunk_id, status=existing["status"])
 
+    os.replace(partial_path, audio_path)
+    upsert_chunk(chunk_id, session_id, seq, str(audio_path), ended_at - started_at,
+                 size_bytes, actual_sha, started_at, ended_at)
+    refresh_session_status(session_id)
     return ChunkUploadResponse(chunk_id=chunk_id, status="pending")
 
 
-@router.get("/api/sessions", response_model=list[SessionResponse])
-async def list_sessions(limit: int = 50, offset: int = 0):
-    sessions = get_sessions(limit, offset)
-    result = []
-    for s in sessions:
-        chunks = get_chunks(s["id"])
-        result.append(SessionResponse(
-            id=s["id"],
-            course_tag=s["course_tag"],
-            started_at=s["started_at"],
-            ended_at=s["ended_at"],
-            status=s["status"],
-            chunks=chunks
-        ))
-    return result
+@router.post("/sessions/{session_id}/finalize", response_model=SessionResponse)
+def finalize(session_id: str, request: FinalizeRequest):
+    """Sent by the phone when recording stops. Order-independent with chunk uploads."""
+    _check_session_id(session_id)
+    ensure_session(session_id, request.course_tag, request.started_at)
+    finalize_session(session_id, request.ended_at, request.chunk_count)
+    refresh_session_status(session_id)
+    return _session_response(get_session(session_id))
 
 
-@router.get("/api/sessions/{session_id}", response_model=SessionResponse)
-async def get_session_detail(session_id: str):
-    session = get_session(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-    chunks = get_chunks(session_id)
+def _session_response(session: dict) -> SessionResponse:
     return SessionResponse(
         id=session["id"],
         course_tag=session["course_tag"],
         started_at=session["started_at"],
         ended_at=session["ended_at"],
+        expected_chunks=session["expected_chunks"],
         status=session["status"],
-        chunks=chunks
+        chunks=get_chunks(session["id"])
     )
 
 
-@router.get("/api/sessions/{session_id}/segments", response_model=list[SegmentResponse])
-async def get_session_segments(session_id: str):
+def _require_session(session_id: str) -> dict:
     session = get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
-    segments = get_segments(session_id)
-    return [SegmentResponse(**seg) for seg in segments]
+    return session
 
 
-@router.get("/api/sessions/{session_id}/audio/{chunk_seq}")
-async def get_chunk_audio(session_id: str, chunk_seq: int):
-    session = get_session(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
+@router.get("/sessions", response_model=list[SessionResponse])
+def list_sessions(limit: int = 50, offset: int = 0):
+    return [_session_response(s) for s in get_sessions(limit, offset)]
 
-    chunks = get_chunks(session_id)
-    chunk = next((c for c in chunks if c["seq"] == chunk_seq), None)
+
+@router.get("/sessions/{session_id}", response_model=SessionResponse)
+def get_session_detail(session_id: str):
+    return _session_response(_require_session(session_id))
+
+
+def session_segments(session_id: str) -> list[dict]:
+    """Segments with start/end converted from chunk time to session time."""
+    offsets = chunk_offsets(get_chunks(session_id))
+    result = []
+    for seg in get_segments(session_id):
+        # Rows written before chunk_id existed encode it in the segment id.
+        chunk_id = seg.get("chunk_id") or seg["id"].rsplit("_seg_", 1)[0]
+        offset = offsets.get(chunk_id, 0)
+        result.append({**seg, "start_ms": seg["start_ms"] + offset, "end_ms": seg["end_ms"] + offset})
+    return sorted(result, key=lambda s: s["start_ms"])
+
+
+@router.get("/sessions/{session_id}/segments", response_model=list[SegmentResponse])
+def get_session_segments(session_id: str):
+    _require_session(session_id)
+    return [SegmentResponse(**seg) for seg in session_segments(session_id)]
+
+
+# Declared before /audio/{chunk_seq} so "full" isn't parsed as a chunk number.
+@router.get("/sessions/{session_id}/audio/full")
+def get_full_audio(session_id: str):
+    _require_session(session_id)
+    try:
+        audio_path = build_session_audio(session_id, get_chunks(session_id), settings.audio_dir)
+    except FileNotFoundError:
+        raise HTTPException(404, "No audio chunks available")
+    except (OSError, RuntimeError) as e:
+        raise HTTPException(500, f"Could not join session audio (is ffmpeg installed?): {e}")
+    return FileResponse(audio_path, media_type="audio/mp4", filename=f"{session_id}_full.m4a")
+
+
+@router.get("/sessions/{session_id}/audio/{chunk_seq:int}")
+def get_chunk_audio(session_id: str, chunk_seq: int):
+    _require_session(session_id)
+    chunk = next((c for c in get_chunks(session_id) if c["seq"] == chunk_seq), None)
     if not chunk:
         raise HTTPException(404, "Chunk not found")
 
@@ -145,125 +214,26 @@ async def get_chunk_audio(session_id: str, chunk_seq: int):
     if not audio_path.exists():
         raise HTTPException(404, "Audio file not found")
 
-    return FileResponse(audio_path, media_type="audio/m4a", filename=f"chunk_{chunk_seq}.m4a")
+    return FileResponse(audio_path, media_type="audio/mp4", filename=f"chunk_{chunk_seq}.m4a")
 
 
-@router.get("/api/sessions/{session_id}/audio/full")
-async def get_full_audio(session_id: str):
-    session = get_session(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-
-    chunks = get_chunks(session_id)
-    synced_chunks = [c for c in chunks if c["status"] in ("synced", "done")]
-    if not synced_chunks:
-        raise HTTPException(404, "No audio chunks available")
-
-    # For simplicity, serve the first chunk as a placeholder
-    # In production, you'd concatenate chunks
-    first_chunk = synced_chunks[0]
-    audio_path = Path(first_chunk["audio_path"])
-    if not audio_path.exists():
-        raise HTTPException(404, "Audio file not found")
-
-    return FileResponse(audio_path, media_type="audio/m4a", filename=f"{session_id}_full.m4a")
+@router.get("/sessions/{session_id}/notes", response_model=NotesResponse)
+def list_notes(session_id: str):
+    _require_session(session_id)
+    return NotesResponse(documents=get_notes(session_id))
 
 
-@router.post("/api/sessions/{session_id}/notes", response_model=NotesResponse)
-async def generate_notes(session_id: str, request: NotesRequest):
-    session = get_session(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-
-    segments = get_segments(session_id)
+@router.post("/sessions/{session_id}/notes", response_model=NotesResponse)
+def generate_notes(session_id: str, request: NotesRequest):
+    session = _require_session(session_id)
+    segments = session_segments(session_id)
     if not segments:
         raise HTTPException(400, "No segments available for notes generation")
 
-    # Group segments by category
-    categorized = {}
-    for seg in segments:
-        cat = seg["category"]
-        if cat not in categorized:
-            categorized[cat] = []
-        categorized[cat].append(seg)
-
-    documents = []
-    for cat, segs in categorized.items():
-        if cat == "filler":
-            continue
-        text = "\n".join(f"[{s['start_ms']}-{s['end_ms']}] {s['source_text']}" for s in segs)
-        summary = await _generate_category_notes(cat, text, request.model)
-        doc_type = _category_to_doc_type(cat)
-        documents.append({
-            "id": f"{session_id}_{doc_type}",
-            "session_id": session_id,
-            "type": doc_type,
-            "content": summary,
-            "generated_at": int(__import__('time').time() * 1000),
-            "model": request.model
-        })
-
-    return NotesResponse(documents=documents)
-
-
-async def _generate_category_notes(category: str, text: str, model: str) -> str:
     try:
-        import requests
-        import os
+        documents = generate_documents(session, segments, request.model)
+    except NotesError as e:
+        raise HTTPException(502, str(e))
 
-        if model == "groq":
-            api_key = os.getenv("GROQ_API_KEY")
-            if not api_key:
-                return "Groq API key not configured"
-            response = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": "llama3-70b-8192",
-                    "messages": [
-                        {"role": "system", "content": _get_system_prompt(category)},
-                        {"role": "user", "content": text}
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 2000
-                },
-                timeout=60
-            )
-            if response.status_code == 200:
-                return response.json()["choices"][0]["message"]["content"]
-        else:
-            ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
-            model_name = os.getenv("NOTES_MODEL", "llama3.1:8b")
-            response = requests.post(
-                f"{ollama_url}/api/generate",
-                json={"model": model_name, "prompt": _get_system_prompt(category) + "\n\n" + text, "stream": False},
-                timeout=120
-            )
-            if response.status_code == 200:
-                return response.json()["response"]
-    except Exception as e:
-        print(f"Notes generation failed: {e}")
-
-    return f"Failed to generate notes for {category}"
-
-
-def _get_system_prompt(category: str) -> str:
-    prompts = {
-        "concept": "Summarize the key concepts and definitions from this lecture transcript. Use clear headings and bullet points.",
-        "example": "Extract and document all worked examples, problems solved, and demonstrations from this transcript.",
-        "announcement": "List all announcements, dates, deadlines, exam info, quiz dates, and administrative details mentioned.",
-        "qa": "Document all questions asked and answers given during Q&A sections.",
-        "action_item": "List all action items, assignments, and tasks mentioned with any deadlines.",
-    }
-    return prompts.get(category, "Summarize this transcript section.")
-
-
-def _category_to_doc_type(category: str) -> str:
-    mapping = {
-        "concept": "concepts",
-        "example": "examples",
-        "announcement": "announcements",
-        "qa": "qa",
-        "action_item": "announcements",
-    }
-    return mapping.get(category, "notes")
+    save_notes(session_id, documents)
+    return NotesResponse(documents=get_notes(session_id))

@@ -1,7 +1,17 @@
 import axios from 'axios';
 import NetInfo from '@react-native-community/netinfo';
-import { storage, MAX_RETRIES, RETRY_BASE_DELAY_MS, PING_INTERVAL_MS } from '../storage';
-import { Chunk, PCConfig, TransferQueueItem } from '../types';
+import RNFS from 'react-native-fs';
+import { storage } from '../storage';
+import {
+  Chunk,
+  ConnectionState,
+  PCConfig,
+  RecordingSession,
+  TransferQueueItem,
+  PING_INTERVAL_MS,
+  RETRY_BASE_DELAY_MS,
+  RETRY_MAX_DELAY_MS,
+} from '../types';
 
 export interface TransferProgress {
   chunkId: string;
@@ -11,32 +21,72 @@ export interface TransferProgress {
 }
 
 type ProgressCallback = (progress: TransferProgress) => void;
+type ConnectionCallback = (state: ConnectionState, ip: string | null) => void;
+
+export class PairingError extends Error {
+  constructor(message: string, readonly reason: 'unauthorized' | 'unreachable') {
+    super(message);
+  }
+}
+
+function toFileUri(path: string): string {
+  return path.startsWith('file://') ? path : `file://${path}`;
+}
+
+function describeError(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const detail = (error.response?.data as { detail?: unknown } | undefined)?.detail;
+    if (error.response) {
+      return `HTTP ${error.response.status}${detail ? `: ${JSON.stringify(detail)}` : ''}`;
+    }
+    return error.message;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
 
 class TransferService {
-  private callbacks: Set<ProgressCallback> = new Set();
+  private progressCallbacks: Set<ProgressCallback> = new Set();
+  private connectionCallbacks: Set<ConnectionCallback> = new Set();
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private unsubscribeNetInfo: (() => void) | null = null;
   private processingQueue = false;
   private pcConfig: PCConfig | null = null;
+  private activeIp: string | null = null;
+  private connection: ConnectionState = 'unpaired';
 
   subscribe(cb: ProgressCallback): () => void {
-    this.callbacks.add(cb);
-    return () => this.callbacks.delete(cb);
+    this.progressCallbacks.add(cb);
+    return () => this.progressCallbacks.delete(cb);
+  }
+
+  subscribeConnection(cb: ConnectionCallback): () => void {
+    this.connectionCallbacks.add(cb);
+    cb(this.connection, this.activeIp);
+    return () => this.connectionCallbacks.delete(cb);
   }
 
   private notify(progress: TransferProgress): void {
-    this.callbacks.forEach((cb) => cb(progress));
+    this.progressCallbacks.forEach((cb) => cb(progress));
   }
 
-  private getBaseUrl(): string {
-    if (!this.pcConfig) return '';
-    return `http://${this.pcConfig.ip}:${this.pcConfig.port}`;
+  private setConnection(state: ConnectionState, ip: string | null): void {
+    this.connection = state;
+    this.activeIp = state === 'connected' ? ip : null;
+    this.connectionCallbacks.forEach((cb) => cb(state, this.activeIp));
   }
 
   async initialize(): Promise<void> {
     this.pcConfig = await storage.getPCConfig();
+    if (!this.unsubscribeNetInfo) {
+      // Joining a different Wi-Fi or hotspot usually means the PC has a different address.
+      this.unsubscribeNetInfo = NetInfo.addEventListener(() => {
+        if (this.pcConfig) {
+          this.pingAndProcess();
+        }
+      });
+    }
     if (this.pcConfig) {
       this.startPingLoop();
-      this.processQueue();
     }
   }
 
@@ -44,13 +94,54 @@ class TransferService {
     this.pcConfig = config;
     await storage.savePCConfig(config);
     this.startPingLoop();
-    this.processQueue();
   }
 
   async clearPCConfig(): Promise<void> {
     this.pcConfig = null;
     await storage.clearPCConfig();
     this.stopPingLoop();
+    this.setConnection('unpaired', null);
+  }
+
+  getPCConfig(): PCConfig | null {
+    return this.pcConfig;
+  }
+
+  isPaired(): boolean {
+    return this.pcConfig !== null;
+  }
+
+  /**
+   * Returns the first of the config's addresses that answers with this token.
+   * Throws PairingError when none do, so pairing screens can explain why.
+   */
+  async findReachableIp(config: PCConfig): Promise<string> {
+    const candidates = [config.lastReachableIp, ...config.ips].filter(
+      (ip, i, all): ip is string => Boolean(ip) && all.indexOf(ip) === i,
+    );
+    let tokenRejected = false;
+
+    for (const ip of candidates) {
+      try {
+        await axios.get(`http://${ip}:${config.port}/api/ping`, {
+          timeout: 4000,
+          headers: { 'X-Pair-Token': config.token },
+        });
+        return ip;
+      } catch (error) {
+        if (axios.isAxiosError(error) && error.response?.status === 401) {
+          tokenRejected = true;
+        }
+      }
+    }
+
+    if (tokenRejected) {
+      throw new PairingError('The PC rejected the pair token. Scan the QR code again.', 'unauthorized');
+    }
+    throw new PairingError(
+      `Could not reach the PC at ${candidates.join(', ') || 'any address'} on port ${config.port}.`,
+      'unreachable',
+    );
   }
 
   private startPingLoop(): void {
@@ -67,141 +158,186 @@ class TransferService {
   }
 
   private async pingAndProcess(): Promise<void> {
-    if (!this.pcConfig) return;
+    const config = this.pcConfig;
+    if (!config) {
+      return;
+    }
+    if (this.connection !== 'connected') {
+      this.setConnection('searching', null);
+    }
 
     try {
-      await axios.get(`${this.getBaseUrl()}/health`, { timeout: 5000 });
-      this.processQueue();
-    } catch {
-      // PC not reachable, will retry on next ping
+      const ip = await this.findReachableIp(config);
+      this.setConnection('connected', ip);
+      if (config.lastReachableIp !== ip) {
+        this.pcConfig = { ...config, lastReachableIp: ip };
+        await storage.savePCConfig(this.pcConfig);
+      }
+      await this.processQueue();
+    } catch (error) {
+      this.setConnection(error instanceof PairingError ? error.reason : 'unreachable', null);
     }
   }
 
   async enqueueChunk(chunk: Chunk): Promise<void> {
-    const queue = await storage.getTransferQueue();
-    const item: TransferQueueItem = {
+    await storage.enqueueTransfer({
+      kind: 'chunk',
       chunkId: chunk.id,
       sessionId: chunk.sessionId,
-      filePath: chunk.audioPath,
       attempts: 0,
-    };
-    await storage.saveTransferQueue([...queue, item]);
+      nextAttemptAt: 0,
+    });
+    this.processQueue();
+  }
+
+  async enqueueFinalize(session: RecordingSession, chunkCount: number): Promise<void> {
+    await storage.enqueueTransfer({
+      kind: 'finalize',
+      sessionId: session.id,
+      endedAt: session.endedAt ?? Date.now(),
+      chunkCount,
+      attempts: 0,
+      nextAttemptAt: 0,
+    });
     this.processQueue();
   }
 
   private async processQueue(): Promise<void> {
-    if (this.processingQueue || !this.pcConfig) return;
-
-    const netInfo = await NetInfo.fetch();
-    if (!netInfo.isConnected) return;
-
+    if (this.processingQueue || !this.pcConfig || !this.activeIp) {
+      return;
+    }
     this.processingQueue = true;
 
     try {
-      const queue = await storage.getTransferQueue();
-      const pending = queue.filter((item) => item.attempts < MAX_RETRIES);
+      const tried = new Set<string>();
+      for (;;) {
+        const now = Date.now();
+        const queue = await storage.getTransferQueue();
+        const item = queue.find((q) => q.nextAttemptAt <= now && !tried.has(this.itemKey(q)));
+        if (!item) {
+          break;
+        }
+        tried.add(this.itemKey(item));
 
-      for (const item of pending) {
-        await this.uploadChunk(item);
-        const updatedQueue = (await storage.getTransferQueue()).filter((q) => q.chunkId !== item.chunkId);
-        await storage.saveTransferQueue(updatedQueue);
+        const ok = await this.send(item);
+        if (!ok && this.connection !== 'connected') {
+          // Lost the PC; the next successful ping resumes the queue.
+          break;
+        }
       }
     } finally {
       this.processingQueue = false;
     }
   }
 
-  private async uploadChunk(item: TransferQueueItem): Promise<void> {
-    const chunks = await storage.getChunks();
-    const chunk = chunks.find((c) => c.id === item.chunkId);
-    if (!chunk) return;
+  private itemKey(item: TransferQueueItem): string {
+    return item.kind === 'chunk' ? `chunk:${item.chunkId}` : `finalize:${item.sessionId}`;
+  }
 
-    const sessions = await storage.getSessions();
-    const session = sessions.find((s) => s.id === chunk.sessionId);
-    if (!session) return;
-
-    this.notify({ chunkId: item.chunkId, progress: 0, status: 'uploading' });
-
+  private async send(item: TransferQueueItem): Promise<boolean> {
     try {
-      const formData = new FormData();
-      formData.append('audio', {
-        uri: `file://${item.filePath}`,
-        name: `chunk_${chunk.seq}.m4a`,
-        type: 'audio/m4a',
-      } as any);
-      formData.append('session_id', chunk.sessionId);
-      formData.append('seq', chunk.seq.toString());
-      formData.append('course_tag', session.courseId);
-      formData.append('started_at', chunk.startedAt.toString());
-      formData.append('ended_at', chunk.endedAt.toString());
+      if (item.kind === 'chunk') {
+        await this.uploadChunk(item);
+      } else {
+        await this.sendFinalize(item);
+      }
+      await storage.removeFromTransferQueue(item);
+      return true;
+    } catch (error) {
+      await this.recordFailure(item, error);
+      return false;
+    }
+  }
 
-      await axios.post(`${this.getBaseUrl()}/api/chunks/upload`, formData, {
-        timeout: 120000,
-        headers: { 'Content-Type': 'multipart/form-data' },
-        onUploadProgress: (e) => {
-          const progress = e.total ? Math.round((e.loaded * 100) / e.total) : 0;
-          this.notify({ chunkId: item.chunkId, progress, status: 'uploading' });
-        },
-      });
+  private async uploadChunk(item: Extract<TransferQueueItem, { kind: 'chunk' }>): Promise<void> {
+    const chunk = (await storage.getChunks()).find((c) => c.id === item.chunkId);
+    if (!chunk || !(await RNFS.exists(chunk.audioPath))) {
+      // Nothing left to send; drop it rather than retrying forever.
+      if (chunk) {
+        await storage.updateChunk(chunk.id, { status: 'failed', error: 'Audio file is missing on the phone' });
+        this.notify({ chunkId: chunk.id, progress: 0, status: 'failed', error: 'Audio file is missing' });
+      }
+      return;
+    }
+    const session = (await storage.getSessions()).find((s) => s.id === chunk.sessionId);
+    const config = this.pcConfig!;
 
-      await this.markChunkSynced(chunk.id);
-      this.notify({ chunkId: item.chunkId, progress: 100, status: 'synced' });
-    } catch (error: any) {
-      const newAttempts = item.attempts + 1;
-      const queue = await storage.getTransferQueue();
-      const updated = queue.map((q) =>
-        q.chunkId === item.chunkId ? { ...q, attempts: newAttempts, lastAttempt: Date.now() } : q
-      );
-      await storage.saveTransferQueue(updated);
+    this.notify({ chunkId: chunk.id, progress: 0, status: 'uploading' });
+    await storage.updateChunk(chunk.id, { status: 'uploading' });
 
-      const delay = RETRY_BASE_DELAY_MS * Math.pow(2, newAttempts - 1);
-      this.notify({
-        chunkId: item.chunkId,
-        progress: 0,
-        status: newAttempts >= MAX_RETRIES ? 'failed' : 'pending',
-        error: error.message,
-      });
+    const formData = new FormData();
+    formData.append('audio', {
+      uri: toFileUri(chunk.audioPath),
+      name: `chunk_${chunk.seq}.m4a`,
+      type: 'audio/mp4',
+    } as any);
+    formData.append('session_id', chunk.sessionId);
+    formData.append('seq', String(chunk.seq));
+    formData.append('course_tag', session?.courseId ?? 'unknown');
+    formData.append('started_at', String(chunk.startedAt));
+    formData.append('ended_at', String(chunk.endedAt));
+    formData.append('session_started_at', String(session?.startedAt ?? chunk.startedAt));
+    formData.append('sha256', await RNFS.hash(chunk.audioPath, 'sha256'));
 
-      if (newAttempts < MAX_RETRIES) {
-        setTimeout(() => this.processQueue(), delay);
+    await axios.post(`http://${this.activeIp}:${config.port}/api/chunks/upload`, formData, {
+      timeout: 120000,
+      headers: { 'Content-Type': 'multipart/form-data', 'X-Pair-Token': config.token },
+      onUploadProgress: (e) => {
+        const progress = e.total ? Math.round((e.loaded * 100) / e.total) : 0;
+        this.notify({ chunkId: chunk.id, progress, status: 'uploading' });
+      },
+    });
+
+    await storage.updateChunk(chunk.id, { status: 'synced', error: undefined });
+    this.notify({ chunkId: chunk.id, progress: 100, status: 'synced' });
+  }
+
+  private async sendFinalize(item: Extract<TransferQueueItem, { kind: 'finalize' }>): Promise<void> {
+    const session = (await storage.getSessions()).find((s) => s.id === item.sessionId);
+    const config = this.pcConfig!;
+    await axios.post(
+      `http://${this.activeIp}:${config.port}/api/sessions/${item.sessionId}/finalize`,
+      {
+        ended_at: item.endedAt,
+        chunk_count: item.chunkCount,
+        course_tag: session?.courseId ?? 'unknown',
+        started_at: session?.startedAt ?? item.endedAt,
+      },
+      { timeout: 15000, headers: { 'X-Pair-Token': config.token } },
+    );
+  }
+
+  private async recordFailure(item: TransferQueueItem, error: unknown): Promise<void> {
+    const message = describeError(error);
+    const attempts = item.attempts + 1;
+    // Keep retrying with capped backoff: the usual cause is simply that the PC is off.
+    const delay = Math.min(RETRY_BASE_DELAY_MS * 2 ** (attempts - 1), RETRY_MAX_DELAY_MS);
+    const key = this.itemKey(item);
+
+    await storage.updateTransferQueue((queue) =>
+      queue.map((q) =>
+        this.itemKey(q) === key ? { ...q, attempts, nextAttemptAt: Date.now() + delay, lastError: message } : q,
+      ),
+    );
+
+    if (item.kind === 'chunk') {
+      await storage.updateChunk(item.chunkId, { status: 'pending', error: message, retryCount: attempts });
+      this.notify({ chunkId: item.chunkId, progress: 0, status: 'pending', error: message });
+    }
+
+    if (axios.isAxiosError(error)) {
+      if (error.response?.status === 401) {
+        this.setConnection('unauthorized', null);
+      } else if (!error.response) {
+        this.setConnection('unreachable', null);
       }
     }
   }
 
-  private async markChunkSynced(chunkId: string): Promise<void> {
-    const chunks = await storage.getChunks();
-    const updated = chunks.map((c) =>
-      c.id === chunkId ? { ...c, status: 'synced' as const } : c
-    );
-    await storage.saveChunks(updated);
-
-    const sessions = await storage.getSessions();
-    const updatedSessions = sessions.map((s) => {
-      const sessionChunks = updated.filter((c) => c.sessionId === s.id);
-      const allSynced = sessionChunks.length > 0 && sessionChunks.every((c) => c.status === 'synced');
-      if (allSynced && s.status !== 'completed') {
-        return { ...s, status: 'completed' as const };
-      }
-      return s;
-    });
-    await storage.saveSessions(updatedSessions);
-  }
-
-  async retryFailed(): Promise<void> {
-    const queue = await storage.getTransferQueue();
-    const failed = queue.filter((item) => item.attempts >= MAX_RETRIES);
-    const reset = failed.map((item) => ({ ...item, attempts: 0 }));
-    const others = queue.filter((item) => item.attempts < MAX_RETRIES);
-    await storage.saveTransferQueue([...others, ...reset]);
-    this.processQueue();
-  }
-
-  getPCConfig(): PCConfig | null {
-    return this.pcConfig;
-  }
-
-  isPaired(): boolean {
-    return this.pcConfig !== null;
+  /** Makes every queued item eligible to send immediately. */
+  async retryNow(): Promise<void> {
+    await storage.updateTransferQueue((queue) => queue.map((q) => ({ ...q, nextAttemptAt: 0 })));
+    await this.pingAndProcess();
   }
 }
 
