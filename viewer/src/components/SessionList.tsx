@@ -57,6 +57,7 @@ export function SessionList() {
     <div className="container">
       <header className="header">
         <h1>Lecture Capture</h1>
+        <a className="btn btn-primary" href="/api/pair" target="_blank" rel="noreferrer">Pair phone</a>
       </header>
       <div className="session-grid">
         {sessions.map(session => (
@@ -74,15 +75,26 @@ export function SessionList() {
                   {session.status}
                 </span>
               </div>
-              <div className="chunk-status">
-                {session.chunks.filter(c => c.status === 'synced' || c.status === 'done').length} / {session.chunks.length} chunks synced
-              </div>
+              <div className="chunk-status">{getChunkSummary(session)}</div>
             </div>
           </Link>
         ))}
       </div>
     </div>
   );
+}
+
+function getChunkSummary(session: Session): string {
+  const received = session.chunks.length;
+  const processed = session.chunks.filter(c => c.status === 'done').length;
+  const failed = session.chunks.filter(c => c.status === 'failed').length;
+  const total = session.expected_chunks ?? received;
+  const parts = [
+    `${received}${session.expected_chunks !== null ? ` / ${total}` : ''} chunks received`,
+    `${processed} processed`,
+  ];
+  if (failed) parts.push(`${failed} failed`);
+  return parts.join(' · ');
 }
 
 function getCourseName(tag: string): string {

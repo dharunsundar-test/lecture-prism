@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { fetchSession, fetchSegments, getFullAudioUrl, generateNotes } from '../api/client';
-import { Session, Segment, CATEGORY_COLORS, CATEGORY_LABELS } from '../types';
+import { fetchSession, fetchSegments, fetchNotes, getFullAudioUrl, generateNotes, errorMessage } from '../api/client';
+import { Session, Segment, NotesDocument, CATEGORY_COLORS, CATEGORY_LABELS } from '../types';
+
+function notesByType(documents: NotesDocument[]): Record<string, string> {
+  return Object.fromEntries(documents.map(doc => [doc.type, doc.content]));
+}
 
 export function SessionView() {
   const { id } = useParams<{ id: string }>();
@@ -13,6 +17,7 @@ export function SessionView() {
   const [model, setModel] = useState<'local' | 'groq'>('local');
   const [generating, setGenerating] = useState(false);
   const [notes, setNotes] = useState<Record<string, string>>({});
+  const [notesError, setNotesError] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const syncInterval = useRef<ReturnType<typeof setInterval>>();
 
@@ -26,12 +31,14 @@ export function SessionView() {
 
   const loadData = async () => {
     try {
-      const [sessionData, segmentsData] = await Promise.all([
+      const [sessionData, segmentsData, notesData] = await Promise.all([
         fetchSession(id!),
         fetchSegments(id!),
+        fetchNotes(id!),
       ]);
       setSession(sessionData);
       setSegments(segmentsData);
+      setNotes(notesByType(notesData));
       setError(null);
     } catch (e) {
       setError('Failed to load session');
@@ -61,15 +68,11 @@ export function SessionView() {
 
   const handleGenerateNotes = async () => {
     setGenerating(true);
+    setNotesError(null);
     try {
-      const result = await generateNotes(id!, model);
-      const notesMap: Record<string, string> = {};
-      result.documents.forEach((doc: any) => {
-        notesMap[doc.type] = doc.content;
-      });
-      setNotes(notesMap);
+      setNotes(notesByType(await generateNotes(id!, model)));
     } catch (e) {
-      console.error('Failed to generate notes', e);
+      setNotesError(`Could not generate notes: ${errorMessage(e)}`);
     } finally {
       setGenerating(false);
     }
@@ -122,12 +125,18 @@ export function SessionView() {
           <button
             className="btn btn-primary"
             onClick={handleGenerateNotes}
-            disabled={generating || Object.keys(notes).length > 0}
+            disabled={generating || segments.length === 0}
           >
-            {generating ? 'Generating...' : Object.keys(notes).length > 0 ? 'Notes Ready' : 'Generate Notes'}
+            {generating ? 'Generating...' : Object.keys(notes).length > 0 ? 'Regenerate Notes' : 'Generate Notes'}
           </button>
         </div>
       </div>
+
+      {notesError && (
+        <div className="card" style={{borderLeft: '4px solid #EF4444', padding: 12, marginBottom: 16, color: '#FCA5A5'}}>
+          {notesError}
+        </div>
+      )}
 
       <div className="player-container">
         <audio

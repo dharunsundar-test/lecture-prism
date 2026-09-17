@@ -47,10 +47,13 @@ A complete lecture capture and notes system with three components:
 ```bash
 cd host
 pip install -e .
-uvicorn app.main:app --reload
-# Server runs on http://localhost:8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Server runs on http://localhost:8000 (0.0.0.0 so the phone can reach it)
 # API docs at http://localhost:8000/docs
+# Tests: pip install pytest httpx && python -m pytest
 ```
+`ffmpeg`/`ffprobe` must be on PATH: they are used for noise reduction, chunk durations and
+joining chunks into the full-session audio the viewer plays.
 
 ### 2. Viewer (Desktop)
 ```bash
@@ -65,15 +68,22 @@ npm run dev
 cd client
 npm install
 npx react-native run-android
-# App shows QR code scanner - scan the code from viewer/host pairing screen
 ```
+Recording runs in an Android foreground service (`android/.../recorder/RecorderService.kt`), so it
+continues with the screen off. iOS recording is not implemented yet.
 
 ## QR Pairing
-The viewer/host shows a QR code with:
+Open http://localhost:8000/api/pair on the PC (or **Pair phone** in the viewer). It shows a QR code with:
 ```json
-{"ip": "192.168.1.xxx", "port": 8000}
+{"ips": ["192.168.1.23", "10.42.0.1"], "port": 8000, "token": "..."}
 ```
-Scan once - the phone stores the IP and auto-uploads chunks when PC is reachable.
+Scan it with **Pair PC** in the app (uses Google's code scanner, so Google Play services are required;
+the page also shows the values for manual entry). The phone tries each IP, so pairing keeps working
+when the PC moves between Wi-Fi and a hotspot, and sends the token as `X-Pair-Token` on every request.
+The token lives in `host/data/pair_token.txt`; delete it to revoke a paired phone.
+
+Recordings stay queued on the phone and upload when the PC is reachable. If the phone never connects,
+allow inbound TCP 8000 for Python in Windows Defender Firewall.
 
 ## Processing Pipeline
 1. **Noise Reduction** - ffmpeg highpass/lowpass + anlmdn
@@ -90,7 +100,7 @@ Scan once - the phone stores the IP and auto-uploads chunks when PC is reachable
 
 ## Configuration
 
-### Host (.env)
+### Host (`host/.env`)
 ```
 HOST=0.0.0.0
 PORT=8000
@@ -98,12 +108,14 @@ DATA_DIR=./data
 OLLAMA_URL=http://localhost:11434
 CLASSIFICATION_MODEL=llama3.1:8b
 NOTES_MODEL=llama3.1:8b
-GROQ_API_KEY=your_key_here  # Optional, for cloud notes
+WHISPER_MODEL=auto                     # auto = large-v3 with CUDA, medium on CPU
+GROQ_API_KEY=your_key_here             # Optional, for cloud notes
+GROQ_MODEL=llama-3.3-70b-versatile     # Check Groq's model list if this is retired
 ```
 
 ### Client
 - Chunk duration: 5 minutes (configurable in `src/types/index.ts`)
-- Retry: Exponential backoff, max 5 attempts
+- Retry: exponential backoff capped at 5 minutes, retried until the PC is reachable
 - Ping interval: 30 seconds
 
 ## Project Structure
@@ -133,14 +145,22 @@ Lecture_Prism/
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check |
-| POST | `/api/chunks/upload` | Upload audio chunk |
+Requests from other machines need `X-Pair-Token`; requests from the PC itself (the viewer) don't.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check (no token) |
+| GET | `/api/ping` | Token check used by the phone |
+| GET | `/api/pair` | Pairing QR page (PC only) |
+| POST | `/api/chunks/upload` | Upload audio chunk (idempotent; optional `sha256`) |
+| POST | `/api/sessions/{id}/finalize` | Phone stopped recording: sets end time and expected chunk count |
 | GET | `/api/sessions` | List all sessions |
 | GET | `/api/sessions/{id}` | Session detail |
-| GET | `/api/sessions/{id}/segments` | Classified segments |
+| GET | `/api/sessions/{id}/segments` | Classified segments (session-relative times) |
 | GET | `/api/sessions/{id}/audio/{seq}` | Chunk audio file |
-| GET | `/api/sessions/{id}/audio/full` | Full session audio |
-| POST | `/api/sessions/{id}/notes` | Generate notes |
+| GET | `/api/sessions/{id}/audio/full` | Full session audio (chunks joined with ffmpeg) |
+| GET | `/api/sessions/{id}/notes` | Saved notes |
+| POST | `/api/sessions/{id}/notes` | Generate and save notes (`{"model": "local" \| "groq"}`) |
 
 ## Development Notes
 
