@@ -1,3 +1,4 @@
+import re
 import time
 from datetime import datetime
 import requests
@@ -20,6 +21,17 @@ PROMPTS = {
     "qa": "Document all questions asked and answers given during Q&A sections.",
 }
 
+TIMESTAMP_INSTRUCTION = (
+    "Each transcript line starts with a [m:ss] timestamp. Start every bullet point with the timestamp "
+    "of the transcript line it is based on, copied exactly, for example: - [12:05] Definition of ..."
+)
+
+# Keeps each request well inside free-tier token limits; longer documents are generated in parts.
+MAX_INPUT_CHARS = 20_000
+
+TIMESTAMP_RE = re.compile(r"\[(\d{1,3}):([0-5]\d)(?::([0-5]\d))?\]")
+BULLET_RE = re.compile(r"^(?:[-*+•]|\d+[.)])\s+")
+
 
 class NotesError(Exception):
     pass
@@ -36,15 +48,73 @@ def generate_documents(session: dict, segments: list[dict], model: str) -> list[
     lecture_date = datetime.fromtimestamp(session["started_at"] / 1000)
     documents = []
     for doc_type, segs in grouped.items():
-        text = "\n".join(f"[{_format_ms(s['start_ms'])}] {s['source_text']}" for s in sorted(segs, key=lambda s: s["start_ms"]))
-        system_prompt = f"{PROMPTS[doc_type]}\nThe lecture was recorded on {lecture_date:%A %Y-%m-%d}."
+        lines = [f"[{format_ms(s['start_ms'])}] {s['source_text']}" for s in sorted(segs, key=lambda s: s["start_ms"])]
+        system_prompt = (
+            f"{PROMPTS[doc_type]}\n{TIMESTAMP_INSTRUCTION}\n"
+            f"The lecture was recorded on {lecture_date:%A %Y-%m-%d}."
+        )
+        parts = [_complete(system_prompt, text, model) for text in split_lines(lines, MAX_INPUT_CHARS)]
         documents.append({
             "type": doc_type,
-            "content": _complete(system_prompt, text, model),
+            "content": "\n\n".join(part.strip() for part in parts),
             "generated_at": int(time.time() * 1000),
             "model": model,
         })
     return documents
+
+
+def split_lines(lines: list[str], max_chars: int) -> list[str]:
+    """Group lines into texts of at most max_chars (a single longer line becomes its own text)."""
+    parts: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in lines:
+        if current and size + len(line) + 1 > max_chars:
+            parts.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        parts.append("\n".join(current))
+    return parts
+
+
+def parse_note_items(content: str) -> list[dict]:
+    """Split generated notes into display items, pulling out each line's [m:ss] timestamp so the
+    viewer can highlight the note being played and seek to it."""
+    items = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        kind = "text"
+        if line.startswith("#"):
+            kind = "heading"
+            line = line.lstrip("#").strip()
+        elif BULLET_RE.match(line):
+            kind = "item"
+            line = BULLET_RE.sub("", line, count=1)
+
+        start_ms = None
+        match = TIMESTAMP_RE.search(line)
+        if match:
+            start_ms = _timestamp_ms(match)
+            line = (line[:match.start()] + line[match.end():]).strip()
+            # Tidy leftovers such as "**[12:05]** text" or "[12:05] - text".
+            line = re.sub(r"^(?:\*\*\s*\*\*|[-–:]\s*)", "", line).strip()
+
+        items.append({"kind": kind, "text": line, "start_ms": start_ms})
+    return items
+
+
+def _timestamp_ms(match: re.Match) -> int:
+    first, second, third = match.group(1), match.group(2), match.group(3)
+    if third is None:
+        minutes, seconds = int(first), int(second)
+        return (minutes * 60 + seconds) * 1000
+    hours, minutes, seconds = int(first), int(second), int(third)
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000
 
 
 def _complete(system_prompt: str, text: str, model: str) -> str:
@@ -66,6 +136,8 @@ def _complete(system_prompt: str, text: str, model: str) -> str:
                 },
                 timeout=120
             )
+            if response.status_code == 429:
+                raise NotesError("Groq rate limit reached; wait a minute and try again, or use the local model")
             _raise_for_status(response, "Groq")
             return response.json()["choices"][0]["message"]["content"]
 
@@ -85,6 +157,6 @@ def _raise_for_status(response: requests.Response, provider: str):
         raise NotesError(f"{provider} returned {response.status_code}: {response.text[:300]}")
 
 
-def _format_ms(ms: int) -> str:
+def format_ms(ms: int) -> str:
     total = ms // 1000
     return f"{total // 60}:{total % 60:02d}"

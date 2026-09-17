@@ -86,14 +86,15 @@ export function SessionList() {
 
 function getChunkSummary(session: Session): string {
   const received = session.chunks.length;
-  const processed = session.chunks.filter(c => c.status === 'done').length;
+  // 'done' is how chunks finished by the earlier per-chunk pipeline are marked.
+  const transcribed = session.chunks.filter(c => c.status === 'transcribed' || c.status === 'done').length;
   const failed = session.chunks.filter(c => c.status === 'failed').length;
-  const total = session.expected_chunks ?? received;
   const parts = [
-    `${received}${session.expected_chunks !== null ? ` / ${total}` : ''} chunks received`,
-    `${processed} processed`,
+    `${received}${session.expected_chunks !== null ? ` / ${session.expected_chunks}` : ''} chunks received`,
+    `${transcribed} transcribed`,
   ];
   if (failed) parts.push(`${failed} failed`);
+  if (session.analysis_status === 'running') parts.push('classifying');
   return parts.join(' · ');
 }
 

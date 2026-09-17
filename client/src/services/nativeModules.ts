@@ -1,4 +1,4 @@
-import { DeviceEventEmitter, NativeModules, Platform } from 'react-native';
+import { DeviceEventEmitter, EventSubscription, NativeEventEmitter, NativeModules, Platform } from 'react-native';
 
 /** Emitted by the Android recorder service each time a chunk file is complete. */
 export interface NativeChunkEvent {
@@ -30,6 +30,17 @@ function requireNative<T>(name: string): T {
   return mod;
 }
 
+// iOS modules (RCTEventEmitter) only deliver events through a NativeEventEmitter bound to the
+// module; on Android the same emitter forwards DeviceEventEmitter events.
+const recorderEvents = NativeModules.LectureRecorder ? new NativeEventEmitter(NativeModules.LectureRecorder) : null;
+
+function subscribe<T>(event: string, listener: (payload: T) => void): () => void {
+  const subscription: EventSubscription = recorderEvents
+    ? recorderEvents.addListener(event, (payload: any) => listener(payload))
+    : DeviceEventEmitter.addListener(event, listener);
+  return () => subscription.remove();
+}
+
 export const nativeRecorder = {
   isAvailable: () => Boolean(NativeModules.LectureRecorder),
 
@@ -39,15 +50,11 @@ export const nativeRecorder = {
   stop: () => requireNative<LectureRecorderNative>('LectureRecorder').stop(),
 
   onChunk(listener: (event: NativeChunkEvent) => void): () => void {
-    const subscription = DeviceEventEmitter.addListener('LectureRecorder.chunk', listener);
-    return () => subscription.remove();
+    return subscribe('LectureRecorder.chunk', listener);
   },
 
   onError(listener: (message: string) => void): () => void {
-    const subscription = DeviceEventEmitter.addListener('LectureRecorder.error', (e: { message: string }) =>
-      listener(e.message),
-    );
-    return () => subscription.remove();
+    return subscribe<{ message: string }>('LectureRecorder.error', (e) => listener(e.message));
   },
 };
 
