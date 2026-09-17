@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+client/node_modules/
+viewer/node_modules/
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Data
+host/data/
+*.db
+*.db-journal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Mobile
+client/android/app/build/
+client/android/.gradle/
+client/ios/build/
+client/ios/Pods/
+
+# Viewer
+viewer/dist/
+
+# Testing
+coverage/
+.nyc_output/
