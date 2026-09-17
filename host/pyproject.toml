@@ -2,7 +2,6 @@
 name = "lecture-capture-host"
 version = "0.1.0"
 description = "Host ingestion server for Lecture Capture"
-readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.109",
@@ -11,17 +10,20 @@ dependencies = [
     "python-multipart>=0.0.6",
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
-    "aiofiles>=23.2",
     "python-dateutil>=2.8",
     "loguru>=0.7",
     "faster-whisper>=1.0",
     "requests>=2.31",
     "dateparser>=1.2",
+    "qrcode>=7.4",
 ]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.uv]
 dev-dependencies = [

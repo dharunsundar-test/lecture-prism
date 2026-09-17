@@ -1,109 +1,103 @@
 import asyncio
-import uuid
+import json
+import threading
+import traceback
+from datetime import datetime
 from pathlib import Path
 from app.db.database import (
-    get_chunks, get_pending_chunks, update_chunk_status, create_segment, update_session_status
+    get_pending_chunks, get_session, update_chunk_status, update_chunk_duration,
+    replace_chunk_segments, refresh_session_status, reset_interrupted_chunks
 )
+from app.services.audio import probe_duration_ms
 from app.services.processing import (
-    reduce_noise, transcribe_audio, detect_speaker_roles, classify_segments
+    reduce_noise, transcribe_audio, detect_speaker_roles, classify_segments, parse_deadline
 )
 from app.core.config import settings
 
 
+POLL_INTERVAL_S = 10
+
+
 class ProcessingWorker:
+    """Processes chunks on a background thread. Transcription and LLM calls take minutes and
+    would otherwise block the event loop, making the server look offline to the phone."""
+
     def __init__(self):
-        self.running = False
-        self.task: asyncio.Task | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
 
     async def start(self):
-        self.running = True
-        self.task = asyncio.create_task(self._run_loop())
+        reset_interrupted_chunks()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run_loop, name="processing-worker", daemon=True)
+        self._thread.start()
 
     async def stop(self):
-        self.running = False
-        if self.task:
-            self.task.cancel()
+        self._stop.set()
+        if self._thread:
+            # A chunk mid-transcription can't be interrupted; it is reset to pending on next start.
+            await asyncio.to_thread(self._thread.join, 5)
+
+    def _run_loop(self):
+        while not self._stop.is_set():
+            pending = []
             try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
+                pending = get_pending_chunks()
+                for chunk in pending:
+                    if self._stop.is_set():
+                        break
+                    self._process_chunk(chunk)
+            except Exception:
+                print(f"Processing loop error:\n{traceback.format_exc()}")
+            if not pending:
+                self._stop.wait(POLL_INTERVAL_S)
 
-    async def _run_loop(self):
-        while self.running:
-            try:
-                await self._process_pending()
-            except Exception as e:
-                print(f"Processing loop error: {e}")
-            await asyncio.sleep(10)
-
-    async def _process_pending(self):
-        pending = get_pending_chunks()
-        for chunk in pending:
-            if not self.running:
-                break
-            await self._process_chunk(chunk)
-
-    async def _process_chunk(self, chunk: dict):
+    def _process_chunk(self, chunk: dict):
         chunk_id = chunk["id"]
         audio_path = Path(chunk["audio_path"])
         session_id = chunk["session_id"]
+        denoised_path = audio_path.with_name(audio_path.stem + ".denoised.wav")
 
         print(f"Processing chunk {chunk_id}")
-
         update_chunk_status(chunk_id, "processing")
 
         try:
-            denoised_path = audio_path.with_suffix(".wav")
-            if not reduce_noise(audio_path, denoised_path):
-                denoised_path = audio_path
+            session = get_session(session_id)
+            lecture_start = datetime.fromtimestamp(session["started_at"] / 1000)
 
-            segments = transcribe_audio(denoised_path)
-            if not segments:
-                raise Exception("Transcription returned no segments")
+            duration_ms = probe_duration_ms(audio_path)
+            if duration_ms:
+                update_chunk_duration(chunk_id, duration_ms)
+
+            source = denoised_path if reduce_noise(audio_path, denoised_path) else audio_path
+            segments = transcribe_audio(source)
+            (settings.transcripts_dir / f"{chunk_id}.json").write_text(json.dumps(segments), encoding="utf-8")
 
             segments = detect_speaker_roles(segments)
-            classified = classify_segments(segments)
+            classified = classify_segments(segments, lecture_start) if segments else []
 
-            for i, seg in enumerate(classified):
-                segment_id = f"{chunk_id}_seg_{i}"
-                deadline = None
-                if seg.get("deadline"):
-                    try:
-                        from dateparser import parse as parse_date
-                        dt = parse_date(seg["deadline"])
-                        if dt:
-                            deadline = int(dt.timestamp() * 1000)
-                    except Exception:
-                        pass
-
-                create_segment(
-                    segment_id=segment_id,
-                    session_id=session_id,
-                    start_ms=int(seg["start"] * 1000),
-                    end_ms=int(seg["end"] * 1000),
-                    category=seg["category"],
-                    summary=seg.get("summary"),
-                    inferred_deadline=deadline,
-                    source_text=seg["text"]
-                )
+            replace_chunk_segments(chunk_id, session_id, [
+                {
+                    "start_ms": int(seg["start"] * 1000),
+                    "end_ms": int(seg["end"] * 1000),
+                    "category": seg["category"],
+                    "summary": seg.get("summary"),
+                    "inferred_deadline": parse_deadline(seg.get("deadline"), lecture_start),
+                    "source_text": seg["text"],
+                }
+                for seg in classified
+            ])
 
             update_chunk_status(chunk_id, "done")
-            print(f"Chunk {chunk_id} processed successfully")
+            print(f"Chunk {chunk_id} processed successfully ({len(classified)} segments)")
 
         except Exception as e:
-            print(f"Chunk {chunk_id} processing failed: {e}")
-            update_chunk_status(chunk_id, "failed", str(e))
+            print(f"Chunk {chunk_id} processing failed:\n{traceback.format_exc()}")
+            update_chunk_status(chunk_id, "failed", f"{type(e).__name__}: {e}")
 
         finally:
-            if denoised_path != audio_path and denoised_path.exists():
-                denoised_path.unlink(missing_ok=True)
-
-            chunks = get_chunks(session_id)
-            if all(c["status"] in ("done", "failed") for c in chunks):
-                if all(c["status"] == "done" for c in chunks):
-                    update_session_status(session_id, "done")
-                else:
-                    update_session_status(session_id, "failed")
+            denoised_path.unlink(missing_ok=True)
+            refresh_session_status(session_id)
 
 
 processing_worker = ProcessingWorker()
